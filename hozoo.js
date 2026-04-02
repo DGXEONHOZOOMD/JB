@@ -1,13 +1,20 @@
-import makeWASocket, {
+  import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason,
-  Browsers
+  Browsers,
+  downloadMediaMessage
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import P from 'pino';
 import readline from 'readline';
-import { existsSync, mkdirSync } from 'fs';
+import { existsSync, mkdirSync, createWriteStream } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+import axios from 'axios';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 // Fungsi untuk input di terminal
 const question = (text) => {
@@ -26,12 +33,33 @@ const question = (text) => {
 // Fungsi delay
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// Fungsi download gambar dari URL ke local
+async function downloadImage(url, filepath) {
+  const writer = createWriteStream(filepath);
+  const response = await axios({
+    url,
+    method: 'GET',
+    responseType: 'stream'
+  });
+  response.data.pipe(writer);
+  return new Promise((resolve, reject) => {
+    writer.on('finish', resolve);
+    writer.on('error', reject);
+  });
+}
+
+// Daftar grup (akan diisi otomatis)
+let groupList = [];
+
 // Fungsi utama bot
 async function startBot() {
   try {
-    // Buat folder auth jika belum ada
     if (!existsSync('auth')) {
       mkdirSync('auth');
+    }
+    
+    if (!existsSync('temp')) {
+      mkdirSync('temp');
     }
 
     console.log('📡 Mengambil versi terbaru Baileys...');
@@ -48,7 +76,8 @@ async function startBot() {
       printQRInTerminal: false,
       markOnlineOnConnect: false,
       syncFullHistory: false,
-      generateHighQualityLinkPreview: false
+      generateHighQualityLinkPreview: false,
+      defaultQueryTimeoutMs: 60000
     });
     
     sock.ev.on('creds.update', saveCreds);
@@ -70,27 +99,60 @@ async function startBot() {
         console.log('\n✅ Bot berhasil terhubung ke WhatsApp!');
         console.log(`📱 Bot aktif sebagai: ${sock.user.id.split(':')[0]}\n`);
         
-        // Tampilkan daftar grup
+        // Ambil semua grup
         try {
           const groups = await sock.groupFetchAllParticipating();
+          groupList = Object.keys(groups).map(jid => ({
+            id: jid,
+            name: groups[jid].subject
+          }));
+          
           console.log('📋 DAFTAR GRUP YANG DIIKUTI:');
-          Object.keys(groups).forEach(jid => {
-            console.log(`   📌 ${groups[jid].subject}`);
-            console.log(`      ID: ${jid}\n`);
+          groupList.forEach((group, index) => {
+            console.log(`   ${index + 1}. ${group.name}`);
+            console.log(`      ID: ${group.id}\n`);
           });
+          
+          if (groupList.length === 0) {
+            console.log('⚠️ Bot tidak mengikuti grup manapun!');
+            console.log('💡 Tambahkan bot ke grup terlebih dahulu\n');
+            return;
+          }
+          
+          // Tanya mode pengiriman
+          console.log('\n=== PILIH MODE PENGIRIMAN ===');
+          console.log('1. Kirim ke semua grup (random urutan)');
+          console.log('2. Kirim ke grup tertentu saja');
+          console.log('3. Kirim random ke 1 grup setiap kali\n');
+          
+          const mode = await question('Pilih mode (1/2/3): ');
+          
+          if (mode === '1') {
+            // Mode semua grup
+            console.log('\n🚀 Memulai pengiriman ke SEMUA GRUP secara bergantian...');
+            await sendImageToAllGroups(sock);
+          } else if (mode === '2') {
+            // Mode grup tertentu
+            console.log('\n📝 Pilih grup:');
+            groupList.forEach((group, index) => {
+              console.log(`   ${index + 1}. ${group.name}`);
+            });
+            const pilihan = await question('\nMasukkan nomor grup: ');
+            const selectedGroup = groupList[parseInt(pilihan) - 1];
+            if (selectedGroup) {
+              console.log(`\n🚀 Memulai pengiriman ke grup: ${selectedGroup.name}`);
+              await sendImageToSpecificGroup(sock, selectedGroup.id);
+            }
+          } else if (mode === '3') {
+            // Mode random
+            console.log('\n🎲 Memulai pengiriman RANDOM ke 1 grup setiap kali...');
+            await sendImageRandomGroup(sock);
+          } else {
+            console.log('❌ Mode tidak valid!');
+          }
+          
         } catch (e) {
-          console.log('⚠️ Tidak bisa mengambil daftar grup');
-        }
-        
-        // Tanya ingin mulai kirim otomatis?
-        const jawaban = await question('🚀 Mulai kirim gambar otomatis ke grup? (y/n): ');
-        
-        if (jawaban.toLowerCase() === 'y') {
-          // Minta ID grup
-          const groupId = await question('📝 Masukkan ID grup (contoh: 120363xxxxxxxxx@g.us): ');
-          sendImageToGroup(sock, groupId);
-        } else {
-          console.log('⏸️ Bot standby. Jalankan ulang untuk mengirim gambar');
+          console.error('❌ Gagal mengambil daftar grup:', e.message);
         }
       }
     });
@@ -125,14 +187,69 @@ async function startBot() {
   }
 }
 
-// Fungsi kirim gambar ke grup
-async function sendImageToGroup(sock, groupJid) {
+// Fungsi kirim gambar ke SEMUA GRUP (bergantian)
+async function sendImageToAllGroups(sock) {
   const imageUrl = 'https://i.ibb.co.com/WptdtTd3/New-Project-1-7-A4129-F.png';
   const caption = '🤖 BOT WHATSAPP OTOMATIS\n\n📸 Gambar dikirim secara otomatis';
   
-  console.log('\n🔄 Memulai pengiriman gambar otomatis...');
-  console.log(`📡 Target grup: ${groupJid}`);
-  console.log('⏱️ Delay antar kirim: 5 detik');
+  // Download gambar sekali untuk reuse
+  const localPath = join(__dirname, 'temp', 'image.jpg');
+  console.log('📥 Mendownload gambar...');
+  await downloadImage(imageUrl, localPath);
+  console.log('✅ Gambar siap dikirim\n');
+  
+  console.log(`🎯 Target: ${groupList.length} grup`);
+  console.log('🔄 Mode: Bergantian ke semua grup');
+  console.log('⏱️ Delay: 10 detik antar pengiriman');
+  console.log('🛑 Tekan Ctrl+C untuk berhenti\n');
+  
+  let counter = 1;
+  let groupIndex = 0;
+  
+  while (true) {
+    try {
+      if (!sock.user) {
+        console.log('⚠️ Bot terputus');
+        break;
+      }
+      
+      const targetGroup = groupList[groupIndex % groupList.length];
+      console.log(`📤 [${counter}] Mengirim ke: ${targetGroup.name}...`);
+      
+      // Kirim gambar dari file local (lebih reliable)
+      await sock.sendMessage(targetGroup.id, {
+        image: { url: localPath },
+        caption: `${caption}\n\n📨 Pengiriman ke-${counter}\n👥 Grup: ${targetGroup.name}\n⏰ ${new Date().toLocaleString('id-ID')}`
+      });
+      
+      console.log(`✅ [${counter}] Berhasil ke ${targetGroup.name} - ${new Date().toLocaleTimeString()}`);
+      counter++;
+      groupIndex++;
+      
+      // Delay 10 detik
+      await delay(10000);
+      
+    } catch (error) {
+      console.error(`❌ Gagal kirim #${counter}:`, error.message);
+      await delay(15000);
+    }
+  }
+}
+
+// Fungsi kirim gambar ke 1 GRUP TERTENTU (unlimited)
+async function sendImageToSpecificGroup(sock, groupId) {
+  const imageUrl = 'https://i.ibb.co.com/WptdtTd3/New-Project-1-7-A4129-F.png';
+  const caption = '🤖 BOT WHATSAPP OTOMATIS\n\n📸 Gambar dikirim secara otomatis';
+  
+  const localPath = join(__dirname, 'temp', 'image.jpg');
+  console.log('📥 Mendownload gambar...');
+  await downloadImage(imageUrl, localPath);
+  console.log('✅ Gambar siap dikirim\n');
+  
+  const group = groupList.find(g => g.id === groupId);
+  console.log(`🎯 Target grup: ${group?.name || groupId}`);
+  console.log('🔄 Mode: Unlimited (loop terus)');
+  console.log('⏱️ Delay: 7 detik antar kirim');
   console.log('🛑 Tekan Ctrl+C untuk berhenti\n');
   
   let counter = 1;
@@ -144,15 +261,62 @@ async function sendImageToGroup(sock, groupJid) {
         break;
       }
       
-      await sock.sendMessage(groupJid, {
-        image: { url: imageUrl },
+      await sock.sendMessage(groupId, {
+        image: { url: localPath },
         caption: `${caption}\n\n📨 Pengiriman ke-${counter}\n⏰ ${new Date().toLocaleString('id-ID')}`
       });
       
       console.log(`✅ [${counter}] Terkirim - ${new Date().toLocaleTimeString()}`);
       counter++;
       
-      await delay(5000);
+      await delay(7000);
+      
+    } catch (error) {
+      console.error(`❌ Gagal kirim #${counter}:`, error.message);
+      await delay(10000);
+    }
+  }
+}
+
+// Fungsi kirim gambar RANDOM ke 1 grup setiap kali
+async function sendImageRandomGroup(sock) {
+  const imageUrl = 'https://i.ibb.co.com/WptdtTd3/New-Project-1-7-A4129-F.png';
+  const caption = '🤖 BOT WHATSAPP OTOMATIS\n\n📸 Gambar dikirim secara otomatis';
+  
+  const localPath = join(__dirname, 'temp', 'image.jpg');
+  console.log('📥 Mendownload gambar...');
+  await downloadImage(imageUrl, localPath);
+  console.log('✅ Gambar siap dikirim\n');
+  
+  console.log(`🎲 Mode: Random dari ${groupList.length} grup`);
+  console.log('🔄 Setiap kirim pilih grup berbeda');
+  console.log('⏱️ Delay: 8 detik antar kirim');
+  console.log('🛑 Tekan Ctrl+C untuk berhenti\n');
+  
+  let counter = 1;
+  
+  while (true) {
+    try {
+      if (!sock.user) {
+        console.log('⚠️ Bot terputus');
+        break;
+      }
+      
+      // Pilih grup random
+      const randomIndex = Math.floor(Math.random() * groupList.length);
+      const targetGroup = groupList[randomIndex];
+      
+      console.log(`🎲 [${counter}] Random pilih: ${targetGroup.name}`);
+      
+      await sock.sendMessage(targetGroup.id, {
+        image: { url: localPath },
+        caption: `${caption}\n\n📨 Pengiriman ke-${counter}\n🎲 Grup random: ${targetGroup.name}\n⏰ ${new Date().toLocaleString('id-ID')}`
+      });
+      
+      console.log(`✅ [${counter}] Terkirim ke ${targetGroup.name} - ${new Date().toLocaleTimeString()}`);
+      counter++;
+      
+      await delay(8000);
       
     } catch (error) {
       console.error(`❌ Gagal kirim #${counter}:`, error.message);
@@ -169,6 +333,4 @@ process.on('SIGINT', () => {
 
 // Jalankan bot
 console.log('🚀 STARTING WHATSAPP BOT...\n');
-console.log('📦 Pastikan package sudah terinstall:\n');
-console.log('   npm install @whiskeysockets/baileys @hapi/boom pino readline\n');
 startBot().catch(console.error);
